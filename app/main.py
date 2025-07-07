@@ -1,5 +1,7 @@
 # app/main.py
 from fastapi import FastAPI
+from fastapi.concurrency import asynccontextmanager
+from .core import firebase_service
 from fastapi.middleware.cors import CORSMiddleware # เพิ่ม CORS Middleware
 from .routers import auth_router, user_router
 from .db.database import Base, engine # ถ้าจะให้ SQLAlchemy สร้างตาราง
@@ -10,12 +12,15 @@ from .routers import (
     master_data_router,
     booking_round_router
 )
-# Uncomment บรรทัดนี้ถ้าคุณต้องการให้ SQLAlchemy พยายามสร้างตารางตาม models.py
-# (ต้องแน่ใจว่า User ใน DB_USER มีสิทธิ์ CREATE TABLE)
-# Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Truck Booking API - Login")
-
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup event
+    await firebase_service.initialize_firebase()  # เรียกใช้ฟังก์ชันเชื่อมต่อกับ Firebase ในช่วง startup
+    yield  # ให้ FastAPI รันส่วนอื่น ๆ ของแอป
+    # Shutdown event (หากต้องการ)
+    await firebase_service.close_firebase() 
 # --- CORS Middleware ---
 # อนุญาตให้ Flutter Web App (หรือ Client อื่นๆ) เรียก API นี้ได้
 # ใน Development อาจจะใช้ origins = ["*"]

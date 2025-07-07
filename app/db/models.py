@@ -1,6 +1,7 @@
 # app/db/models.py
 
 from datetime import date, datetime
+from typing import List
 from sqlalchemy import (
     Boolean, Column, ForeignKey, Integer, String, DateTime, Date, Time,
     Enum as SAEnum, func, DECIMAL
@@ -86,15 +87,30 @@ class SystemUser(Base):
     display_name: Mapped[str] = mapped_column(String(255), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     vencode_ref: Mapped[str] = mapped_column(String(10), ForeignKey("mvendor.vencode", name="fk_sysusers_vencode_mvendor"), nullable=True)
+    fcm_token: Mapped[str] = mapped_column(String(255), nullable=True)  # เพิ่มฟิลด์นี้สำหรับเก็บ FCM token
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
-
     # Relationship to MVendor (Many-to-One, but conceptually One-to-One from this side)
     vendor_details: Mapped["MVendor"] = relationship(
         back_populates="user_account",
         foreign_keys=[vencode_ref], # Explicitly define which local column is the foreign key
         lazy="joined" # Use joined loading to get vendor details with user
     )
+class DOH(Base):
+    __tablename__ = "doh" # ชื่อตารางใน Database ของคุณ
+
+    doid: Mapped[str] = mapped_column(String(10), primary_key=True, index=True)
+    shipid: Mapped[str] = mapped_column(String(10), ForeignKey("shipment.shipid", name="fk_doh_shipid_shipment"), index=True)
+    dlvdate: Mapped[date] = mapped_column(Date)
+    cusid: Mapped[str] = mapped_column(String(10))
+    cusname: Mapped[str] = mapped_column(String(100))
+    route: Mapped[str] = mapped_column(String(6))
+    routedes: Mapped[str] = mapped_column(String(100), nullable=True)
+    province: Mapped[str] = mapped_column(String(2)) # เป็น varchar(2) ตามรูป
+    volumn: Mapped[float] = mapped_column(DECIMAL(13, 3)) # เป็น DECIMAL(13,3) ตามรูป
+
+    # Relationship กลับไปยัง Shipment
+    shipment: Mapped["Shipment"] = relationship(back_populates="details")
 
 class BookingRound(Base):
     __tablename__ = "booking_round"
@@ -148,3 +164,8 @@ class Shipment(Base):
     mvendor: Mapped["MVendor"] = relationship()
     mcar: Mapped["MCar"] = relationship()
     booking_round: Mapped["BookingRound"] = relationship(back_populates="shipments")
+    details: Mapped[List["DOH"]] = relationship(
+        back_populates="shipment",
+        cascade="all, delete-orphan", # Optional: ถ้าลบ Shipment ให้ลบ DOs ที่เกี่ยวข้องด้วย
+        lazy="selectin" # Eager load details มาพร้อมกับ Shipment
+    )

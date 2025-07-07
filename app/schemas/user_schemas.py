@@ -17,3 +17,5 @@ class User(UserBase):
     car_count: int = 0
     class Config:
         from_attributes = True
+class FCMTokenUpdate(BaseModel):
+    fcm_token: str

@@ -1,7 +1,9 @@
 # app/schemas/shipment_schemas.py
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional, Any, List
-from datetime import datetime
+from datetime import date, datetime
+
+from app.schemas import shipment_detail_schemas
 
 # ShipmentBase จะเก็บเฉพาะ Fields ที่จำเป็นสำหรับการ "สร้าง" Shipment
 class ShipmentCreate(BaseModel):
@@ -32,7 +34,7 @@ class Shipment(ShipmentCreate): # สืบทอด Fields ทั้งหม�
     current_grade_to_assign: Optional[str] = None
     confirmed_by_grade: Optional[str] = None
     cruser: Optional[str] = None
-
+    details: List[shipment_detail_schemas.ShipmentDetail] = []
     # Fields ที่มีปัญหา
     crdate: Optional[datetime] = None
     chuser: Optional[str] = None

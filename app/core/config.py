@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     DB_USER: str = os.getenv("DB_USER", "fallback_user")
     DB_PASS: str = os.getenv("DB_PASS", "fallback_pass")
     DB_NAME: str = os.getenv("DB_NAME", "fallback_db")
-
+    FIREBASE_SERVICE_ACCOUNT_PATH: str = (r"D:\y1\internship\py\app\firebase_service_account.json")
     @property
     def DATABASE_URL(self) -> str:
         # ใช้ค่าที่ Pydantic ได้อ่านมา (ซึ่งก็คือค่าที่ os.getenv ดึงมา)

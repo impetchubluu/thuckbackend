@@ -1,5 +1,6 @@
 # app/routers/user_router.py
 from fastapi import APIRouter, Depends, HTTPException
+from grpc import Status
 from sqlalchemy.orm import Session
 from typing import List # Import List for type hinting
 
@@ -8,6 +9,7 @@ from ..schemas.car_schemas import Car as CarSchema # Import CarSchema
 from ..db import models, crud
 from ..core import security
 from ..db.database import get_db
+from app.schemas import user_schemas
 
 router = APIRouter(
     tags=["Users (Authenticated)"] # เปลี่ยน Tag
@@ -48,3 +50,14 @@ async def read_users_me(
             print(f"Warning: Vendor details not found in mvendor for vencode_ref: {current_user.vencode_ref}")
 
     return UserResponseSchema(**user_response_data)
+@router.post("/update-fcm-token", response_model=user_schemas.User)
+async def update_fcm_token(
+    token_data: user_schemas.FCMTokenUpdate,
+    current_user: models.SystemUser = Depends(security.get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """
+    รับ FCM Token จาก Client และบันทึกลงใน Database ของ User ที่ Login อยู่
+    """
+    print(f"Updating FCM token for user {current_user.username} to {token_data.fcm_token}")
+    return crud.update_user_fcm_token(db=db, user=current_user, new_token=token_data.fcm_token)
