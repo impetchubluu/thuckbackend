@@ -3,7 +3,21 @@ from pydantic import BaseModel, Field
 from typing import Optional, List
 from datetime import date, datetime, time
 from .shipment_schemas import Shipment
+# Schema สำหรับ Master เวลา (จากตาราง mbooking_round)
+class MasterBookingRound(BaseModel):
+    round_time: time
+    round_name: Optional[str] = None
+    class Config: from_attributes = True
 
+# Schema สำหรับแต่ละรอบที่ส่งมาจาก Client เพื่อ Save
+class RoundTimeInput(BaseModel):
+    round_time_str: str # รับเป็น String เช่น "10:00"
+
+# Schema สำหรับ Request Body หลักตอน Save
+class SaveDayRoundsRequest(BaseModel):
+    round_date: date
+    warehouse_code: str
+    rounds: List[RoundTimeInput]
 class BookingRoundBase(BaseModel):
     round_name: str
     round_date: date

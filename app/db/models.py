@@ -24,8 +24,8 @@ class StandardStatEnum(str, enum.Enum):
 
 class MWarehouse(Base):
     __tablename__ = "mwarehouse"
-    warehouse_code: Mapped[str] = mapped_column(String(10), primary_key=True)
-    warehouse_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    warehouse_code: Mapped[str] = mapped_column(String(4), primary_key=True) # **PK ต้องตรงกับ shipment.shippoint**
+    warehouse_name: Mapped[str] = mapped_column(String(255))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 class MBookingRound(Base):
@@ -134,10 +134,10 @@ class Shipment(Base):
     shipid: Mapped[str] = mapped_column(String(10), primary_key=True, index=True)
     customer_name: Mapped[str] = mapped_column(String(255), nullable=True)
     doctype: Mapped[str] = mapped_column(String(4), nullable=True)
-    shippoint: Mapped[str] = mapped_column(String(4), nullable=True)
+    shippoint: Mapped[str] = mapped_column(String(4), ForeignKey("mwarehouse.warehouse_code"))
     province: Mapped[int] = mapped_column(Integer, ForeignKey("mprovince.province"), nullable=True)
     route: Mapped[str] = mapped_column(String(6), nullable=True)
-    shiptype: Mapped[str] = mapped_column(String(2), ForeignKey("mshiptype.cartype"), nullable=True)
+    cartype: Mapped[str] = mapped_column(String(2), ForeignKey("mshiptype.cartype"), nullable=True)
     vencode: Mapped[str] = mapped_column(String(10), ForeignKey("mvendor.vencode"), nullable=True)
     carlicense: Mapped[str] = mapped_column(String(20), ForeignKey("mcar.carlicense"), nullable=True)
     carnote: Mapped[str] = mapped_column(String(255), nullable=True)
@@ -159,6 +159,11 @@ class Shipment(Base):
     confirmed_by_grade: Mapped[str] = mapped_column(String(1), nullable=True)
 
     # Relationships to get descriptive data
+    warehouse: Mapped["MWarehouse"] = relationship(
+    "MWarehouse", # ระบุชื่อคลาสเป้าหมาย
+    primaryjoin="Shipment.shippoint == MWarehouse.warehouse_code", # ระบุเงื่อนไขการ JOIN อย่างชัดเจน
+    lazy="joined"
+)
     mprovince: Mapped["MProvince"] = relationship(lazy="joined")
     mshiptype: Mapped["MShipType"] = relationship(lazy="joined")
     mvendor: Mapped["MVendor"] = relationship()

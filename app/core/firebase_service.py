@@ -34,13 +34,19 @@ def send_fcm_notification(token: str, title: str, body: str, data: dict = None) 
             return error_msg
 
     message = messaging.Message(
-        notification=messaging.Notification(
-            title=title,
-            body=body,
-        ),
-        token=token,
-        data=data or {} # เพิ่ม data payload (optional)
+    notification=messaging.Notification(
+        title=title,
+        body=body,
+    ),
+    token=token,
+    data=data or {},
+    android=messaging.AndroidConfig(
+        priority='high', # บอกให้ Android ให้ความสำคัญสูง
+        notification=messaging.AndroidNotification(
+            channel_id='high_importance_channel' # ระบุ Channel ID ให้ตรงกับใน AndroidManifest
+        )
     )
+)
     try:
         response = messaging.send(message)
         print(f"Successfully sent message: {response}")

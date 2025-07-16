@@ -3,9 +3,9 @@ from sqlalchemy.orm import Session, joinedload, selectinload
 from . import models
 from ..schemas import shipment_schemas, booking_round_schemas
 from typing import List, Optional
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, time
 from sqlalchemy import func
-
+from sqlalchemy.orm import joinedload
 # --- User CRUD ---
 def get_user_by_username(db: Session, username: str) -> Optional[models.SystemUser]:
     return db.query(models.SystemUser).options(joinedload(models.SystemUser.vendor_details)).filter(models.SystemUser.username == username).first()
@@ -94,13 +94,22 @@ def create_booking_round(db: Session, round_in: booking_round_schemas.BookingRou
 
 # --- Shipment CRUD ---
 def get_unassigned_shipments(db: Session, filters: dict) -> List[models.Shipment]:
-    query = db.query(models.Shipment).filter(models.Shipment.booking_round_id == None, models.Shipment.is_on_hold == False)
+    query = (db.query(models.Shipment)
+               # --- จุดสำคัญคือบรรทัดนี้ ---
+                .options(
+                   joinedload(models.Shipment.warehouse),
+                   joinedload(models.Shipment.mshiptype)
+               )
+               .filter(models.Shipment.booking_round_id == None, models.Shipment.is_on_hold == False)
+    )
+
     if filters.get("shippoint"):
         query = query.filter(models.Shipment.shippoint == filters["shippoint"])
     if filters.get("apmdate"):
-        query = query.filter(func.date(models.Shipment.apmdate) == filters["apmdate"])
+        # แปลง string date เป็น date object ก่อนเทียบ
+        query = query.filter(func.date(models.Shipment.apmdate) == filters["apmdate"]) 
+        
     return query.order_by(models.Shipment.shipid).all()
-
 def get_held_shipments(db: Session, filters: dict) -> List[models.Shipment]:
     query = db.query(models.Shipment).filter(models.Shipment.is_on_hold == True)
     # ... add filters ...
@@ -166,4 +175,54 @@ def complete_or_cancel_car_assignment(db: Session, shipid: str, new_status: str)
         db.commit()
         return True
     return False
-# ... (CRUD อื่นๆ สำหรับ Shipment ที่จำเป็น) ...
+
+def get_master_booking_rounds(db: Session) -> List[models.MBookingRound]:
+    """ดึง Master เวลารอบทั้งหมดที่ Active"""
+    return db.query(models.MBookingRound).filter(models.MBookingRound.is_active == True).order_by(models.MBookingRound.round_time).all()
+def save_day_rounds(db: Session, request: booking_round_schemas.SaveDayRoundsRequest, creator_id: str):
+    """
+    จัดการการบันทึกรอบของทั้งวัน (ลบอันเก่าที่ไม่มี, สร้าง/อัปเดตอันใหม่)
+    """
+    # 1. ดึงรอบทั้งหมดที่มีอยู่แล้วสำหรับวันและคลังสินค้านี้
+    existing_rounds = db.query(models.BookingRound).filter(
+        models.BookingRound.round_date == request.round_date,
+        models.BookingRound.warehouse_code == request.warehouse_code
+    ).all()
+
+    # 2. ลบรอบเก่าที่ไม่มีอยู่ใน Request ใหม่
+    # (วิธีนี้ง่ายที่สุด คือลบทั้งหมดแล้วสร้างใหม่)
+    for old_round in existing_rounds:
+        # ก่อนลบ ต้อง un-assign shipments ก่อน
+        (db.query(models.Shipment)
+           .filter(models.Shipment.booking_round_id == old_round.id)
+           .update({"booking_round_id": None}, synchronize_session=False))
+        db.delete(old_round)
+    
+    db.flush() # Execute delete commands
+
+    # 3. สร้างรอบใหม่ทั้งหมดตามที่ส่งมา
+    new_rounds = []
+    for i, round_data in enumerate(request.rounds):
+        try:
+            # แปลง string "HH:mm" เป็น time object
+            time_parts = round_data.round_time_str.split(':')
+            new_time = time(hour=int(time_parts[0]), minute=int(time_parts[1]))
+        except (ValueError, IndexError):
+            continue # ข้ามถ้า format เวลาผิด
+
+        db_round = models.BookingRound(
+            round_name=f"รอบที่ {i + 1}",
+            round_date=request.round_date,
+            round_time=new_time,
+            warehouse_code=request.warehouse_code,
+            created_by=creator_id,
+            status='pending'
+        )
+        db.add(db_round)
+        new_rounds.append(db_round)
+    
+    db.commit()
+    
+    # ไม่จำเป็นต้อง refresh object เพราะเราจะ query ใหม่จาก frontend
+    # แต่ถ้าต้องการคืนค่ากลับไป ก็ต้อง query ใหม่อีกครั้ง
+    return True

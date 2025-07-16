@@ -4,6 +4,7 @@ from typing import Optional, Any, List
 from datetime import date, datetime
 
 from app.schemas import shipment_detail_schemas
+from app.schemas.car_schemas import CarBase
 
 # ShipmentBase จะเก็บเฉพาะ Fields ที่จำเป็นสำหรับการ "สร้าง" Shipment
 class ShipmentCreate(BaseModel):
@@ -12,21 +13,25 @@ class ShipmentCreate(BaseModel):
     shippoint: Optional[str] = Field(None, max_length=4)
     province: int
     route: Optional[str] = Field(None, max_length=6)
-    shiptype: str = Field(..., max_length=2) # รหัสประเภทรถ (cartype)
+    cartype: str = Field(..., max_length=2) # รหัสประเภทรถ (cartype)
     dockno: Optional[str] = Field(None, max_length=15)
     quantity: Optional[int] = None
     volume_cbm: Optional[float] = None
     apmdate: datetime
+class ShipTypeSchema(BaseModel):
+    cartype: str
+    cartypedes: str
 
+    class Config:
+        from_attributes = True
 # Shipment คือ Schema สำหรับ Response ซึ่งจะมีข้อมูลทั้งหมด
 class Shipment(ShipmentCreate): # สืบทอด Fields ทั้งหมดจาก ShipmentCreate
-    # --- Fields เพิ่มเติมที่ได้จากการ Join หรือมี Default ใน DB ---
     doctype: Optional[str] = None
     provname: Optional[str] = None
-    shiptype_desc: Optional[str] = None
     confirmed_vencode: Optional[str] = Field(None, alias="vencode")
     confirmed_vendor_name: Optional[str] = None
-    carlicense: Optional[str] = None # <<--- แก้ไขการสะกดคำที่นี่
+    carlicense: Optional[str] = None
+    warehouse_name: Optional[str] = None
     carnote: Optional[str] = None
     docstat: Optional[str] = None
     is_on_hold: bool = False
@@ -34,6 +39,7 @@ class Shipment(ShipmentCreate): # สืบทอด Fields ทั้งหม�
     current_grade_to_assign: Optional[str] = None
     confirmed_by_grade: Optional[str] = None
     cruser: Optional[str] = None
+    mshiptype: Optional[ShipTypeSchema] = None
     details: List[shipment_detail_schemas.ShipmentDetail] = []
     # Fields ที่มีปัญหา
     crdate: Optional[datetime] = None

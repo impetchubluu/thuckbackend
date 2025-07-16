@@ -4,6 +4,8 @@ from sqlalchemy.orm import Session
 from typing import List
 from datetime import date
 
+from app.db import crud, models
+
 from .. import db, schemas
 from ..core import security
 
@@ -41,3 +43,20 @@ async def create_new_booking_round(
 
     # TODO: เพิ่ม Validation เช่น ไม่สามารถสร้างรอบซ้ำในวันและเวลาเดียวกันได้
     return db.crud.create_booking_round(db=db_session, round_in=round_in, creator_id=current_user.username)
+@router.post("/save-for-day", status_code=status.HTTP_200_OK)
+async def save_rounds_for_day(
+    request_body: schemas.booking_round_schemas.SaveDayRoundsRequest,
+    current_user: models.SystemUser = Depends(security.get_current_active_user),
+    db_session: Session = Depends(db.database.get_db)
+):
+    """
+    รับลิสต์ของรอบทั้งหมดสำหรับวัน/คลังที่ระบุ และทำการ Sync (ลบ/สร้างใหม่)
+    """
+    if current_user.role not in [models.UserRoleEnum.dispatcher, models.UserRoleEnum.admin]:
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+
+    try:
+        crud.save_day_rounds(db=db_session, request=request_body, creator_id=current_user.username)
+        return {"message": "Booking rounds for the day have been saved successfully."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save rounds: {e}")

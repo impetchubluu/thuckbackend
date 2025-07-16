@@ -1,4 +1,5 @@
 # app/schemas/master_data_schemas.py
+from datetime import time
 from pydantic import BaseModel
 from typing import Optional
 
@@ -23,3 +24,9 @@ class ControlCode(BaseModel):
     contcode: str
     contdese: Optional[str] = None
     class Config: from_attributes = True
+class MasterBookingRound(BaseModel):
+    round_time: time
+    round_name: Optional[str] = None
+
+    class Config:
+        from_attributes = True
