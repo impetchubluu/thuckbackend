@@ -44,6 +44,7 @@ app.include_router(user_router.router, prefix="/users")
 app.include_router(shipment_router.router, prefix="/api/v1/shipments")
 app.include_router(master_data_router.router, prefix="/api/v1/master")
 app.include_router(booking_round_router.router, prefix="/api/v1/booking-rounds")
+app.include_router(user_router.router, prefix="/api/v1/users", tags=["Users & Profiles"])
 @app.get("/")
 async def root():
     return {"message": "Welcome to Truck Booking API! Use /auth/login to login."}

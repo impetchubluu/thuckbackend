@@ -2,14 +2,16 @@
 from fastapi import APIRouter, Depends, HTTPException
 from grpc import Status
 from sqlalchemy.orm import Session
-from typing import List # Import List for type hinting
+from typing import List
+
+from app.routers.shipment_router import get_dispatcher_and_admin_roles # Import List for type hinting
 
 from ..schemas.user_schemas import User as UserResponseSchema
 from ..schemas.car_schemas import Car as CarSchema # Import CarSchema
 from ..db import models, crud
 from ..core import security
 from ..db.database import get_db
-from app.schemas import user_schemas
+from app.schemas import user_schemas, vendor_schemas
 
 router = APIRouter(
     tags=["Users (Authenticated)"] # เปลี่ยน Tag
@@ -50,6 +52,18 @@ async def read_users_me(
             print(f"Warning: Vendor details not found in mvendor for vencode_ref: {current_user.vencode_ref}")
 
     return UserResponseSchema(**user_response_data)
+@router.get("/vendors/all", response_model=List[vendor_schemas.VendorProfileWithCars], summary="Get all vendor profiles")
+async def get_all_vendors(
+    current_user: models.SystemUser = Depends(security.get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """
+    สำหรับ Admin/Dispatcher: ดึงข้อมูลโปรไฟล์ของ Vendor ทั้งหมด
+    """
+    if current_user.role not in get_dispatcher_and_admin_roles(): # ใช้ helper function เดิม
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+        
+    return crud.get_all_vendor_profiles(db)
 @router.post("/update-fcm-token", response_model=user_schemas.User)
 async def update_fcm_token(
     token_data: user_schemas.FCMTokenUpdate,

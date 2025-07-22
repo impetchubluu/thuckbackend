@@ -4,8 +4,7 @@ from . import models
 from ..schemas import shipment_schemas, booking_round_schemas
 from typing import List, Optional
 from datetime import date, datetime, timedelta, time
-from sqlalchemy import func
-from sqlalchemy.orm import joinedload
+from sqlalchemy import and_, func, not_, or_
 # --- User CRUD ---
 def get_user_by_username(db: Session, username: str) -> Optional[models.SystemUser]:
     return db.query(models.SystemUser).options(joinedload(models.SystemUser.vendor_details)).filter(models.SystemUser.username == username).first()
@@ -25,10 +24,13 @@ def get_shipments(db: Session, filters: dict = None) -> List[models.Shipment]:
         filters = {}
         
     query = db.query(models.Shipment).options(
-        selectinload(models.Shipment.details) # โหลด details มาด้วยเพื่อประสิทธิภาพ
+        selectinload(models.Shipment.details),  # Eager load details
+        joinedload(models.Shipment.warehouse),  # Eager load warehouse
+        joinedload(models.Shipment.mshiptype),  # Eager load ship type
+        joinedload(models.Shipment.mleadtime)   # Eager load lead time
     )
+    
 
-    # ตัวอย่างการใช้ Filter
     if filters.get("docstat"):
         query = query.filter(models.Shipment.docstat == filters["docstat"])
     
@@ -42,24 +44,47 @@ def get_shipments(db: Session, filters: dict = None) -> List[models.Shipment]:
     
     if filters.get("apmdate_to"):
         query = query.filter(models.Shipment.apmdate <= filters["apmdate_to"])
-    
-    # เพิ่ม Filter อื่นๆ ตามต้องการ
-    # ...
+
     
     return query.order_by(models.Shipment.apmdate.desc()).all()
 
 
-def get_shipments_for_vendor(db: Session, grade: str) -> List[models.Shipment]:
+def get_vendor_by_grade(db: Session, grade: str) -> Optional[models.SystemUser]:
+    """ดึง User คนแรกที่เจอในเกรดที่ระบุ"""
+    return (db.query(models.SystemUser)
+              .join(models.MVendor, models.SystemUser.vencode_ref == models.MVendor.vencode)
+              .filter(models.MVendor.grade == grade)
+              .first())
+
+def get_shipments_for_vendor(db: Session, grade: str, vencode: str) -> List[models.Shipment]:
     """
-    ดึงรายการ Shipments ที่ถูกส่งให้ Vendor ตามเกรด
-    และมีสถานะรอการตอบรับ (เช่น docstat = '02')
+    ดึงรายการ Shipments สำหรับ Vendor
+    - งานที่ถูกส่งให้เกรดของตนเองโดยเฉพาะ (docstat='02')
+    - งานเปิดที่ทุกคนเห็น (docstat='BC')
     """
     return (db.query(models.Shipment)
               .options(selectinload(models.Shipment.details))
               .filter(
-                  models.Shipment.current_grade_to_assign == grade,
-                  models.Shipment.docstat == '02' # สถานะรอ Vendor ตอบรับ
-              )
+    or_(
+        # เงื่อนไขกลุ่มที่ 1: ต้องเป็นจริงทั้งสองอย่าง
+        and_(
+            models.Shipment.docstat == '02',
+            models.Shipment.current_grade_to_assign == grade
+        ),
+        
+        # เงื่อนไขกลุ่มที่ 2
+           and_(
+                          models.Shipment.docstat == 'BC',
+                          # --- แก้ไขเงื่อนไขนี้ ---
+                          or_(
+                              # กรณีที่ยังไม่มีใครปฏิเสธเลย (field เป็น NULL)
+                              models.Shipment.rejected_by_vencodes.is_(None),
+                              # กรณีที่มีคนปฏิเสธแล้ว และเราไม่ได้อยู่ในนั้น
+                              not_(models.Shipment.rejected_by_vencodes.contains(vencode))
+                          )
+                      )
+    )
+)
               .order_by(models.Shipment.apmdate.desc())
               .all())
 # --- Booking Round CRUD ---
@@ -98,7 +123,8 @@ def get_unassigned_shipments(db: Session, filters: dict) -> List[models.Shipment
                # --- จุดสำคัญคือบรรทัดนี้ ---
                 .options(
                    joinedload(models.Shipment.warehouse),
-                   joinedload(models.Shipment.mshiptype)
+                   joinedload(models.Shipment.mshiptype),
+                   joinedload(models.Shipment.mleadtime),
                )
                .filter(models.Shipment.booking_round_id == None, models.Shipment.is_on_hold == False)
     )
@@ -120,6 +146,52 @@ def get_vendor_fcm_token_by_username(db: Session, username: str) -> Optional[str
     if user and user.fcm_token:
         return user.fcm_token  # คืนค่า FCM Token ของ Vendor
     return None
+def assign_job_to_car(db: Session, shipment: models.Shipment) -> Optional[models.MCar]:
+    """
+    ฟังก์ชันหลักในการจ่ายงานให้รถ:
+    1. ตรวจสอบข้อมูลที่จำเป็น
+    2. คำนวณวันที่รถจะว่าง
+    3. อัปเดตสถานะและวันที่ว่างของรถ
+    """
+    # 1. ตรวจสอบข้อมูล
+    if not (shipment.carlicense and shipment.apmdate and shipment.route and shipment.province is not None):
+        print(f"WARNING: Shipment {shipment.shipid} is missing required data for availability calculation.")
+        return None
+
+    # 2. ดึงข้อมูลรถและ Lead Time
+    car_to_update = db.query(models.MCar).filter(models.MCar.carlicense == shipment.carlicense).first()
+    if not car_to_update:
+        print(f"ERROR: Car with license {shipment.carlicense} not found.")
+        return None
+
+    # ดึง Lead Time
+    province_obj = db.query(models.MProvince).filter(models.MProvince.province == shipment.province).first()
+    if not province_obj:
+        print(f"ERROR: Province with ID {shipment.province} not found.")
+        return None
+
+    lead_time_obj = db.query(models.MLeadTime).filter(
+        models.MLeadTime.route == shipment.route
+                ).first()
+
+    if not lead_time_obj or not lead_time_obj.leadtime:
+        print(f"ERROR: Lead time not found for route {shipment.route} and province {province_obj.provname}.")
+        return None
+        
+    lead_time_days = int(lead_time_obj.leadtime)
+
+    # 3. คำนวณวันที่รถจะว่าง
+    appointment_date = shipment.apmdate.date()
+    available_date = appointment_date + timedelta(days=lead_time_days - 1)
+
+    # 4. อัปเดตข้อมูลรถ
+    car_to_update.stat = models.StandardStatEnum.inactive # เปลี่ยนสถานะเป็น "ไม่ใช้งาน"
+    car_to_update.will_be_available_at = available_date
+
+    # 5. ไม่ต้อง commit ที่นี่ ให้ Router เป็นตัวจัดการ Transaction
+    
+    print(f"INFO: Car {car_to_update.carlicense} availability will be updated to {available_date.isoformat()}.")
+    return car_to_update
 def update_user_fcm_token(db: Session, user: models.SystemUser, new_token: str) -> models.SystemUser:
     """
     อัปเดต FCM Token สำหรับ User ที่ระบุ
@@ -130,7 +202,28 @@ def update_user_fcm_token(db: Session, user: models.SystemUser, new_token: str) 
         db.commit()
         db.refresh(user)
     return user
+def get_shipment_for_update(db: Session, shipid: str) -> Optional[models.Shipment]:
+    """
+    ดึงข้อมูล Shipment พร้อมกับ Lock แถวข้อมูลนั้นใน Transaction
+    เพื่อป้องกัน Race Condition
+    """
+    return db.query(models.Shipment).filter(models.Shipment.shipid == shipid).with_for_update().first()
 
+def get_all_vendor_profiles(db: Session) -> List[models.MVendor]:
+    """
+    ดึงข้อมูลโปรไฟล์ของ Vendor ทั้งหมด (สำหรับ Admin/Dispatcher)
+    พร้อมกับ Eager Load ข้อมูลรถของแต่ละ Vendor มาด้วย
+    """
+    return (db.query(models.MVendor)
+              .options(
+                  selectinload(models.MVendor.cars),
+                  selectinload(models.MVendor.user_account)
+              )
+              .order_by(models.MVendor.grade, models.MVendor.venname) # เรียงตามเกรด และตามชื่อ
+              .all())
+def get_all_vendors(db: Session) -> List[models.SystemUser]:
+    """ดึง user ที่มี role เป็น vendor ทั้งหมด"""
+    return db.query(models.SystemUser).filter(models.SystemUser.role == models.UserRoleEnum.vendor, models.SystemUser.is_active == True).all()
 def get_users_by_grade(db: Session, grade: str) -> List[models.SystemUser]:
     """
     ดึง User ทั้งหมดในเกรดที่ระบุ (เพื่อส่ง Notification)
@@ -139,7 +232,63 @@ def get_users_by_grade(db: Session, grade: str) -> List[models.SystemUser]:
               .join(models.MVendor, models.SystemUser.vencode_ref == models.MVendor.vencode)
               .filter(models.MVendor.grade == grade, models.SystemUser.is_active == True)
               .all())
+def get_ongoing_shipments(db: Session, vencode: Optional[str] = None) -> List[models.Shipment]:
+    """
+    ดึงรายการ Shipments ที่กำลังดำเนินการอยู่
+    - ถ้ามี vencode: ดึงเฉพาะของ Vendor คนนั้น
+    - ถ้าไม่มี vencode (None): ดึงของทุก Vendor (สำหรับ Admin/Dispatcher)
+    """
+    in_progress_statuses = ['03', '04', '05']
+    
+    query = (db.query(models.Shipment)
+               .options(selectinload(models.Shipment.details))
+               .filter(models.Shipment.docstat.in_(in_progress_statuses)))
+    
+    # เพิ่มเงื่อนไขการกรอง vencode ถ้ามีการส่งค่าเข้ามา
+    if vencode:
+        query = query.filter(models.Shipment.vencode == vencode)
+        
+    return query.order_by(models.Shipment.apmdate.asc()).all()
 
+
+def get_past_shipments(db: Session, vencode: Optional[str] = None, filters: dict = None) -> List[models.Shipment]:
+    """
+    ดึงประวัติงานที่เสร็จสิ้นหรือยกเลิกไปแล้ว
+    - ถ้ามี vencode: ดึงเฉพาะของ Vendor คนนั้น
+    - ถ้าไม่มี vencode: ดึงของทุก Vendor (สำหรับ Admin/Dispatcher)
+    - รองรับการ Filter เพิ่มเติม
+    """
+    if filters is None:
+        filters = {}
+
+    final_statuses = ['06', 'RJ', '05'] # เพิ่ม 05 เข้าไปด้วย
+    
+    query = (db.query(models.Shipment)
+               .options(selectinload(models.Shipment.details)) # Eager load details
+               .filter(models.Shipment.docstat.in_(final_statuses)))
+    
+    # --- Logic เดิม ---
+    if vencode:
+        query = query.filter(models.Shipment.vencode == vencode)
+    
+    # --- เพิ่ม Logic การ Filter สำหรับ Admin/Dispatcher ---
+    if filters.get("shipid"):
+        query = query.filter(models.Shipment.shipid.like(f"%{filters['shipid']}%"))
+    
+    if filters.get("route"):
+        # ต้อง JOIN กับ details (DOH) เพื่อ filter ตาม route
+        # SQLAlchemy จะทำ auto-join ถ้ามี relationship แต่เพื่อความชัดเจน เราใช้ join()
+        query = query.join(models.DOH).filter(models.DOH.route == filters["route"])
+
+    if filters.get("apmdate_from"):
+        query = query.filter(models.Shipment.apmdate >= filters["apmdate_from"])
+        
+    if filters.get("apmdate_to"):
+        # บวก 1 วันเพื่อให้รวมวันสิ้นสุดเข้าไปด้วย
+        end_date = datetime.fromisoformat(filters["apmdate_to"]) + timedelta(days=1)
+        query = query.filter(models.Shipment.apmdate < end_date)
+
+    return query.order_by(models.Shipment.chdate.desc()).limit(200).all()
 def get_all_dispatchers(db: Session) -> List[models.SystemUser]:
     """
     ดึง Dispatchers และ Admins ทั้งหมด (เพื่อส่ง Notification)

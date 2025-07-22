@@ -3,7 +3,7 @@
 from datetime import date, datetime
 from typing import List
 from sqlalchemy import (
-    Boolean, Column, ForeignKey, Integer, String, DateTime, Date, Time,
+    JSON, Boolean, Column, ForeignKey, Integer, String, DateTime, Date, Time,
     Enum as SAEnum, func, DECIMAL
 )
 from sqlalchemy.orm import relationship, Mapped, mapped_column # Use Mapped for modern type-annotated style
@@ -40,7 +40,6 @@ class MProvince(Base):
     province: Mapped[int] = mapped_column(Integer, primary_key=True)
     provname: Mapped[str] = mapped_column(String(100))
     stat: Mapped[StandardStatEnum] = mapped_column(SAEnum("ใช้งาน", "ไม่ใช้งาน", name="mprovince_stat_enum"))
-
 class MShipType(Base):
     __tablename__ = "mshiptype"
     cartype: Mapped[str] = mapped_column(String(2), primary_key=True)
@@ -59,7 +58,7 @@ class MCar(Base):
     cartypedes: Mapped[str] = mapped_column(String(255))
     remark: Mapped[str] = mapped_column(String(255), nullable=True)
     stat: Mapped[StandardStatEnum] = mapped_column(SAEnum("ใช้งาน", "ไม่ใช้งาน", name="mcar_stat_enum"), default="ใช้งาน")
-
+    will_be_available_at: Mapped[date] = mapped_column(Date, nullable=True)
     # Relationship back to MVendor
     owner_vendor: Mapped["MVendor"] = relationship(back_populates="cars")
 
@@ -128,7 +127,27 @@ class BookingRound(Base):
 
     # Relationship to Shipments in this round
     shipments: Mapped[list["Shipment"]] = relationship(back_populates="booking_round", lazy="selectin")
+class MLeadTime(Base):
+    __tablename__ = "mleadtime"
+    route: Mapped[str] = mapped_column(String(6), primary_key=True)
+    provth: Mapped[str] = mapped_column(String(100))
+    routedes: Mapped[str] = mapped_column(String(255))
+    proven: Mapped[str] = mapped_column(String(100))
+    zone: Mapped[str] = mapped_column(String(10))
+    zonedes: Mapped[str] = mapped_column(String(100))
+    leadtime: Mapped[float] = mapped_column(DECIMAL(10, 2), nullable=False)
+    class Config:
+        from_attributes = True
 
+class DocStatEnum(str, enum.Enum):
+    WAITING_ROUND = '01'      # รอจัดเข้ารอบ
+    WAITING_VENDOR = '02'     # รอ Vendor เกรดที่ระบุยืนยัน
+    VENDOR_CONFIRMED = '03'   # Vendor ยืนยันแล้ว
+    DISPATCHER_ASSIGNED = '04'# Dispatcher จ่ายงานแล้ว
+    CANCELED = '06'           # ยกเลิกโดย Dispatcher
+    BROADCAST = 'BC'          # งานเปิดให้ทุกเกรด
+    REJECTED_ALL = 'RJ'       # ถูกปฏิเสธทั้งหมด
+    ON_HOLD = 'HD'            # พักงาน
 class Shipment(Base):
     __tablename__ = "shipment"
     shipid: Mapped[str] = mapped_column(String(10), primary_key=True, index=True)
@@ -136,7 +155,7 @@ class Shipment(Base):
     doctype: Mapped[str] = mapped_column(String(4), nullable=True)
     shippoint: Mapped[str] = mapped_column(String(4), ForeignKey("mwarehouse.warehouse_code"))
     province: Mapped[int] = mapped_column(Integer, ForeignKey("mprovince.province"), nullable=True)
-    route: Mapped[str] = mapped_column(String(6), nullable=True)
+    route: Mapped[str] = mapped_column(String(6), ForeignKey("mleadtime.route"), nullable=True)
     cartype: Mapped[str] = mapped_column(String(2), ForeignKey("mshiptype.cartype"), nullable=True)
     vencode: Mapped[str] = mapped_column(String(10), ForeignKey("mvendor.vencode"), nullable=True)
     carlicense: Mapped[str] = mapped_column(String(20), ForeignKey("mcar.carlicense"), nullable=True)
@@ -151,12 +170,14 @@ class Shipment(Base):
     chdate: Mapped[datetime] = mapped_column(DateTime, nullable=True)
     sapstat: Mapped[str] = mapped_column(String(1), nullable=True)
     sapupdate: Mapped[datetime] = mapped_column(DateTime, nullable=True)
-    docstat: Mapped[str] = mapped_column(String(2), nullable=True)
+    docstat: Mapped[DocStatEnum] = mapped_column(String(2), nullable=True)
     booking_round_id: Mapped[int] = mapped_column(Integer, ForeignKey("booking_round.id"), nullable=True)
     is_on_hold: Mapped[bool] = mapped_column(Boolean, default=False)
     docstat_before_hold: Mapped[str] = mapped_column(String(2), nullable=True)
     current_grade_to_assign: Mapped[str] = mapped_column(String(1), nullable=True)
     confirmed_by_grade: Mapped[str] = mapped_column(String(1), nullable=True)
+    assigned_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+    rejected_by_vencodes: Mapped[list] = mapped_column(JSON, nullable=True)
 
     # Relationships to get descriptive data
     warehouse: Mapped["MWarehouse"] = relationship(
@@ -164,6 +185,11 @@ class Shipment(Base):
     primaryjoin="Shipment.shippoint == MWarehouse.warehouse_code", # ระบุเงื่อนไขการ JOIN อย่างชัดเจน
     lazy="joined"
 )
+    mleadtime : Mapped["MLeadTime"] = relationship(
+        "MLeadTime",
+        primaryjoin="Shipment.route == MLeadTime.route",
+        lazy="joined"
+    )
     mprovince: Mapped["MProvince"] = relationship(lazy="joined")
     mshiptype: Mapped["MShipType"] = relationship(lazy="joined")
     mvendor: Mapped["MVendor"] = relationship()
@@ -171,6 +197,6 @@ class Shipment(Base):
     booking_round: Mapped["BookingRound"] = relationship(back_populates="shipments")
     details: Mapped[List["DOH"]] = relationship(
         back_populates="shipment",
-        cascade="all, delete-orphan", # Optional: ถ้าลบ Shipment ให้ลบ DOs ที่เกี่ยวข้องด้วย
-        lazy="selectin" # Eager load details มาพร้อมกับ Shipment
+        cascade="all, delete-orphan",
+        lazy="selectin" 
     )

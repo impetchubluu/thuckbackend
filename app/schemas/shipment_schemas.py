@@ -24,6 +24,18 @@ class ShipTypeSchema(BaseModel):
 
     class Config:
         from_attributes = True
+class MProvince(BaseModel):
+    province: int
+    provname: str
+
+    class Config:
+        from_attributes = True
+class MLeadTimeSchema(BaseModel):
+
+    leadtime: float 
+
+    class Config:
+        from_attributes = True
 # Shipment คือ Schema สำหรับ Response ซึ่งจะมีข้อมูลทั้งหมด
 class Shipment(ShipmentCreate): # สืบทอด Fields ทั้งหมดจาก ShipmentCreate
     doctype: Optional[str] = None
@@ -40,13 +52,16 @@ class Shipment(ShipmentCreate): # สืบทอด Fields ทั้งหม�
     confirmed_by_grade: Optional[str] = None
     cruser: Optional[str] = None
     mshiptype: Optional[ShipTypeSchema] = None
+    mprovince: Optional[MProvince] = None
+    mleadtime: Optional[MLeadTimeSchema] = None
     details: List[shipment_detail_schemas.ShipmentDetail] = []
     # Fields ที่มีปัญหา
     crdate: Optional[datetime] = None
     chuser: Optional[str] = None
     chdate: Optional[datetime] = None
     sapstat: Optional[str] = None
-    sapupdate: Optional[datetime] = None # <<--- **เพิ่ม Field ที่ขาดไป**
+    sapupdate: Optional[datetime] = None
+    assigned_at: Optional[datetime] = None
 
     @field_validator('crdate', 'chdate', 'sapupdate', 'apmdate', mode='before')
     @classmethod

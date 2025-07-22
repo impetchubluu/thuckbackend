@@ -2,7 +2,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, null
 from typing import List, Optional
 from datetime import date, datetime, timezone
 
@@ -59,7 +59,54 @@ async def read_held_shipments(
     filters = { "shippoint": request.query_params.get("shippoint") }
     active_filters = {k: v for k, v in filters.items() if v is not None}
     return crud.get_held_shipments(db, filters=active_filters)
+@router.get("/my-orders", response_model=List[shipment_schemas.Shipment], summary="Get ongoing orders for user's role")
+async def get_my_ongoing_orders(
+    current_user: models.SystemUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """
+    - Vendor: ดึงงานที่กำลังทำของตัวเอง
+    - Admin/Dispatcher: ดึงงานที่กำลังทำทั้งหมดของทุก Vendor
+    """
+    vencode_to_filter = None
+    
+    # ตรวจสอบ Role
+    if current_user.role == models.UserRoleEnum.vendor:
+        if not current_user.vencode_ref:
+            raise HTTPException(status_code=403, detail="Vendor has no vencode assigned")
+        vencode_to_filter = current_user.vencode_ref
 
+    return crud.get_ongoing_shipments(db, vencode=vencode_to_filter)
+@router.get("/my-history", response_model=List[shipment_schemas.Shipment], summary="Get past orders for user's role")
+async def get_my_past_orders(
+    request: Request, # <-- เพิ่ม request
+    current_user: models.SystemUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """
+    - Vendor: ดึงประวัติงานของตัวเอง
+    - Admin/Dispatcher: ดึงประวัติงานทั้งหมดของทุก Vendor และ Filter ได้
+    """
+    vencode_to_filter = None
+    filters = {}
+
+    if current_user.role == models.UserRoleEnum.vendor:
+        if not current_user.vencode_ref:
+            raise HTTPException(status_code=403, detail="Vendor has no vencode assigned")
+        vencode_to_filter = current_user.vencode_ref
+    
+    # ถ้าเป็น Admin/Dispatcher ให้ดึง Filter จาก query params
+    elif current_user.role in get_dispatcher_and_admin_roles():
+        filters = {
+            "shipid": request.query_params.get("shipid"),
+            "route": request.query_params.get("route"),
+            "apmdate_from": request.query_params.get("apmdate_from"),
+            "apmdate_to": request.query_params.get("apmdate_to"),
+        }
+        # กรองเอาเฉพาะ filter ที่มีค่า
+        filters = {k: v for k, v in filters.items() if v}
+        
+    return crud.get_past_shipments(db, vencode=vencode_to_filter, filters=filters)
 # ===================================================================
 # General GET and Dynamic GET Routes
 # ===================================================================
@@ -86,7 +133,11 @@ async def read_shipments(
         active_filters = {k: v for k, v in filters.items() if v is not None}
         return crud.get_shipments(db, filters=active_filters)
     elif current_user.role == models.UserRoleEnum.vendor and current_user.vendor_details and current_user.vendor_details.grade:
-        return crud.get_shipments_for_vendor(db, grade=current_user.vendor_details.grade)
+        return crud.get_shipments_for_vendor(
+            db, 
+            grade=current_user.vendor_details.grade ,
+            vencode=current_user.vencode_ref
+            )
     else:
         return []
 
@@ -147,6 +198,7 @@ async def request_booking(
     first_grade_in_order = GRADE_ASSIGNMENT_ORDER[0]
     db_shipment.docstat = '02' # 'รอ Vendor ยืนยัน'
     db_shipment.current_grade_to_assign = first_grade_in_order
+    db_shipment.assigned_at = datetime.now(timezone.utc)
     db_shipment.chuser = current_user.username
     db_shipment.chdate = datetime.now(timezone.utc)
     db.commit()
@@ -163,6 +215,8 @@ async def request_booking(
             )
     return db_shipment
 
+# ในไฟล์ app/routers/shipment_router.py
+
 @router.post("/confirm", response_model=shipment_schemas.Shipment, summary="Vendor confirms a booking")
 async def confirm_shipment(
     action: shipment_schemas.ConfirmShipment,
@@ -170,92 +224,129 @@ async def confirm_shipment(
     db: Session = Depends(get_db)
 ):
     """
-    ยืนยันการรับงาน (สำหรับ Vendor เท่านั้น)
+    ยืนยันการรับงาน (สำหรับ Vendor)
+    รองรับทั้งงานปกติ (02) และงานเปิด (BC)
+    ใช้ Transaction Lock เพื่อป้องกัน Race Condition
     """
-    if current_user.role != models.UserRoleEnum.vendor or not current_user.vencode or not current_user.grade:
+    if not (current_user.role == models.UserRoleEnum.vendor and current_user.vencode_ref and current_user.vendor_details):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only vendors can confirm shipments")
+    
+    # --- เริ่ม Transaction ---
+    try:
+        # ดึงข้อมูล Shipment พร้อม Lock แถว
+        db_shipment = crud.get_shipment_for_update(db, shipid=action.shipid)
 
-    db_shipment = crud.get_shipment_by_id(db, shipid=action.shipid)
-    if not db_shipment:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Shipment not found")
-    if db_shipment.docstat != '02' or db_shipment.current_grade_to_assign != current_user.grade:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Shipment is not assigned to your grade or is not in the correct state for confirmation.")
+        if not db_shipment:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Shipment not found")
 
-    # ตรวจสอบรถ
-    car = crud.get_car_by_license(db, carlicense=action.carlicense)
-    if not car:
-        raise HTTPException(status_code=404, detail=f"Car with license '{action.carlicense}' not found.")
-    if car.vencode != current_user.vencode:
-        raise HTTPException(status_code=403, detail=f"Car '{action.carlicense}' does not belong to your company.")
-    if not crud.is_car_available(db, carlisence=action.carlicense, required_datetime=db_shipment.apmdate):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Car '{action.carlicense}' is not available for the required date.")
+        # ตรวจสอบเงื่อนไขการรับงาน
+        can_confirm = False
+        # 1. งานถูกส่งให้เกรดเราโดยตรง
+        if db_shipment.docstat == '02' and db_shipment.current_grade_to_assign == current_user.vendor_details.grade:
+            can_confirm = True
+        # 2. เป็นงานเปิด (Broadcast) และยังไม่มีใครรับ
+        elif db_shipment.docstat == 'BC':
+            can_confirm = True
 
-    db_shipment.docstat = '03' # 'Vendor ยืนยันแล้ว'
-    db_shipment.vencode = current_user.vencode
-    db_shipment.confirmed_by_grade = current_user.grade
-    db_shipment.carlicense = action.carlicense
-    db_shipment.carnote = action.carnote
-    db_shipment.chuser = current_user.username
-    db_shipment.chdate = datetime.now(timezone.utc)
-    db.add(db_shipment)
-    crud.create_car_assignment(db, shipment=db_shipment)
-    db.commit()
-    db.refresh(db_shipment)
+        if not can_confirm:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Job is no longer available or not assigned to you.")
 
-    # Trigger notification to dispatchers
+        # ตรวจสอบรถ (Logic เดิม)
+
+        # --- อัปเดตข้อมูล Shipment ---
+        db_shipment.docstat = '03'  # Vendor ยืนยันแล้ว
+        db_shipment.vencode = current_user.vencode_ref
+        db_shipment.confirmed_by_grade = current_user.vendor_details.grade
+        db_shipment.carlicense = action.carlicense
+        db_shipment.carnote = action.carnote
+        db_shipment.current_grade_to_assign = None # ล้างค่า grade ที่เคย assign
+        db_shipment.assigned_at = None # ล้างเวลา
+        db_shipment.chuser = current_user.username
+        db_shipment.chdate = datetime.now(timezone.utc)
+        
+        # สร้าง Car Assignment (ถ้ามี)
+        # crud.create_car_assignment(db, shipment=db_shipment)
+        updated_car = crud.assign_job_to_car(db, shipment=db_shipment)
+
+        if not updated_car:
+            # กรณีเกิดข้อผิดพลาดภายในฟังก์ชัน CRUD (เช่น หา leadtime ไม่เจอ)
+            # เราต้อง rollback transaction ทั้งหมด
+            raise HTTPException(status_code=500, detail="Failed to update car availability. Check server logs or required shipment data.")
+        db.commit()
+        db.refresh(db_shipment)
+
+    except Exception as e:
+        db.rollback()
+        if isinstance(e, HTTPException):
+            raise e
+        # ถ้าเป็น Error อื่นๆ
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An internal error occurred: {str(e)}")
+    
+    # --- สิ้นสุด Transaction ---
+
+    # Trigger notification to dispatchers (Logic เดิม)
     dispatchers = crud.get_all_dispatchers(db)
     for dispatcher in dispatchers:
         if dispatcher.fcm_token:
             firebase_service.send_fcm_notification(
                 token=dispatcher.fcm_token,
-                title=f"Vendor ยืนยันงานแล้ว (Grade {current_user.grade})",
+                title=f"Vendor ยืนยันงานแล้ว (Grade {current_user.vendor_details.grade})",
                 body=f"Shipment '{db_shipment.shipid}' ถูกยืนยันโดย {current_user.display_name}"
             )
+            
     return db_shipment
-
-@router.post("/reject", response_model=shipment_schemas.Shipment, summary="Vendor rejects a booking")
+@router.post("/reject", response_model=shipment_schemas.Shipment, summary="Vendor rejects a booking and broadcasts it")
 async def reject_shipment(
     action: shipment_schemas.RejectShipment,
     current_user: models.SystemUser = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
-    """ปฏิเสธงาน (สำหรับ Vendor) และส่งต่อไปยังเกรดถัดไป"""
-    if current_user.role != models.UserRoleEnum.vendor or not current_user.grade:
+    """
+    ปฏิเสธงาน  และเปลี่ยนสถานะเป็น Broadcast ให้ทุกคน
+    """
+    if not (current_user.role == models.UserRoleEnum.vendor and current_user.vendor_details and current_user.vendor_details.grade):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only vendors can reject shipments")
 
     db_shipment = crud.get_shipment_by_id(db, shipid=action.shipid)
-    if not db_shipment or db_shipment.docstat != '02' or db_shipment.current_grade_to_assign != current_user.grade:
+    
+    # ตรวจสอบว่างานนี้สามารถถูกปฏิเสธโดย user คนนี้ได้หรือไม่
+    if not db_shipment or db_shipment.docstat != '02' or db_shipment.current_grade_to_assign != current_user.vendor_details.grade:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Shipment cannot be rejected by you at this moment.")
 
-    print(f"INFO: Shipment {action.shipid} rejected by {current_user.username} (Grade {current_user.grade}) with reason: {action.rejection_reason}")
-    try:
-        current_grade_index = GRADE_ASSIGNMENT_ORDER.index(current_user.grade)
-        if current_grade_index + 1 < len(GRADE_ASSIGNMENT_ORDER):
-            next_grade = GRADE_ASSIGNMENT_ORDER[current_grade_index + 1]
-            db_shipment.current_grade_to_assign = next_grade
-            # Notify next grade
-            vendors_to_notify = crud.get_users_by_grade(db, grade=next_grade)
-            for vendor in vendors_to_notify:
-                if vendor.fcm_token:
-                    firebase_service.send_fcm_notification(token=vendor.fcm_token, title="มีงานใหม่ (ส่งต่อ)", body=f"Shipment ID: {db_shipment.shipid} รอการยืนยัน")
-        else:
-            db_shipment.docstat = 'RJ' # All Rejected
-            db_shipment.current_grade_to_assign = None
-            # Notify dispatchers
-            dispatchers = crud.get_all_dispatchers(db)
-            for d in dispatchers:
-                if d.fcm_token:
-                    firebase_service.send_fcm_notification(token=d.fcm_token, title="[ACTION NEEDED] Shipment ถูกปฏิเสธทั้งหมด", body=f"Shipment '{db_shipment.shipid}' ไม่มี Vendor รับงาน")
-    except ValueError:
-        db_shipment.docstat = 'RJ'
-        db_shipment.current_grade_to_assign = None
-    
+    print(f"INFO: Shipment {action.shipid} rejected by {current_user.username}. Broadcasting...")
+    existing_rejected_list = db_shipment.rejected_by_vencodes or []
+
+    # 2. เพิ่ม vencode ของ user ปัจจุบันเข้าไป (ถ้ายังไม่มี)
+    current_vencode = current_user.vencode_ref
+    if current_vencode not in existing_rejected_list:
+        existing_rejected_list.append(current_vencode)
+
+    # --- เปลี่ยน Logic เป็น Broadcast ---
+    db_shipment.rejected_by_vencodes = existing_rejected_list 
+    db_shipment.docstat = 'BC'
+    db_shipment.current_grade_to_assign = None # ไม่มีเกรดที่เจาะจงแล้ว
+    db_shipment.assigned_at = datetime.now(timezone.utc)
     db_shipment.chuser = current_user.username
     db_shipment.chdate = datetime.now(timezone.utc)
+    
     db.commit()
     db.refresh(db_shipment)
-    return db_shipment
 
+    # --- ส่ง Notification ไปหา Vendor ทุกคน (ยกเว้นคนที่เพิ่งปฏิเสธ) ---
+    all_vendors = crud.get_all_vendors(db)
+    for vendor in all_vendors:
+        # ไม่ต้องส่งหาตัวเอง
+        if vendor.username == current_user.username:
+            continue
+        
+        if vendor.fcm_token:
+            firebase_service.send_fcm_notification(
+                token=vendor.fcm_token, 
+                title="[งานเปิด] มีงานใหม่ให้เลือก!", 
+                body=f"Shipment ID: {db_shipment.shipid} เปิดให้รับงานแบบ First-Come, First-Served"
+            )
+            
+    return db_shipment
 @router.post("/{shipid}/hold", response_model=shipment_schemas.Shipment, summary="Hold or Unhold a shipment")
 async def hold_unhold_shipment(
     shipid: str,
@@ -313,6 +404,7 @@ async def manual_assign_vendor(
     db_shipment.vendor_name = vendor_to_assign.display_name
     db_shipment.docstat = '02'
     db_shipment.current_grade_to_assign = vendor_to_assign.vendor_details.grade
+    db_shipment.assigned_at = datetime.now(timezone.utc)
     db_shipment.chuser = current_user.username
     db_shipment.chdate = datetime.now(timezone.utc)
     db.commit()
