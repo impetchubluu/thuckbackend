@@ -70,9 +70,10 @@ class MVendor(Base):
     Score: Mapped[float] = mapped_column(DECIMAL(10, 2), nullable=True)
     perallocate: Mapped[float] = mapped_column(DECIMAL(10, 2), nullable=True)
     stat: Mapped[StandardStatEnum] = mapped_column(SAEnum("ใช้งาน", "ไม่ใช้งาน", name="mvendor_stat_enum"), default="ใช้งาน")
+    last_assigned_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
 
     # Relationship to its Cars (One-to-Many)
-    cars: Mapped[list["MCar"]] = relationship(back_populates="owner_vendor", cascade="all, delete-orphan", lazy="selectin")
+    cars: Mapped[list["MCar"]] = relationship(back_populates="owner_vendor", cascade="all, delete-orphan", lazy="joined")
 
     # Relationship to its SystemUser account (One-to-One)
     user_account: Mapped["SystemUser"] = relationship(back_populates="vendor_details", uselist=False)
@@ -89,6 +90,7 @@ class SystemUser(Base):
     fcm_token: Mapped[str] = mapped_column(String(255), nullable=True)  # เพิ่มฟิลด์นี้สำหรับเก็บ FCM token
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+    
     # Relationship to MVendor (Many-to-One, but conceptually One-to-One from this side)
     vendor_details: Mapped["MVendor"] = relationship(
         back_populates="user_account",
@@ -170,7 +172,7 @@ class Shipment(Base):
     chdate: Mapped[datetime] = mapped_column(DateTime, nullable=True)
     sapstat: Mapped[str] = mapped_column(String(1), nullable=True)
     sapupdate: Mapped[datetime] = mapped_column(DateTime, nullable=True)
-    docstat: Mapped[DocStatEnum] = mapped_column(String(2), nullable=True)
+    docstat: Mapped[DocStatEnum] = mapped_column(String(2), nullable=True, default='01')
     booking_round_id: Mapped[int] = mapped_column(Integer, ForeignKey("booking_round.id"), nullable=True)
     is_on_hold: Mapped[bool] = mapped_column(Boolean, default=False)
     docstat_before_hold: Mapped[str] = mapped_column(String(2), nullable=True)
@@ -178,8 +180,11 @@ class Shipment(Base):
     confirmed_by_grade: Mapped[str] = mapped_column(String(1), nullable=True)
     assigned_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
     rejected_by_vencodes: Mapped[list] = mapped_column(JSON, nullable=True)
-
+    is_on_hold: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    docstat_before_hold: Mapped[str] = mapped_column(String(2), nullable=True)
     # Relationships to get descriptive data
+    mvendor: Mapped["MVendor"] = relationship(lazy="joined")
+
     warehouse: Mapped["MWarehouse"] = relationship(
     "MWarehouse", # ระบุชื่อคลาสเป้าหมาย
     primaryjoin="Shipment.shippoint == MWarehouse.warehouse_code", # ระบุเงื่อนไขการ JOIN อย่างชัดเจน
@@ -192,7 +197,6 @@ class Shipment(Base):
     )
     mprovince: Mapped["MProvince"] = relationship(lazy="joined")
     mshiptype: Mapped["MShipType"] = relationship(lazy="joined")
-    mvendor: Mapped["MVendor"] = relationship()
     mcar: Mapped["MCar"] = relationship()
     booking_round: Mapped["BookingRound"] = relationship(back_populates="shipments")
     details: Mapped[List["DOH"]] = relationship(

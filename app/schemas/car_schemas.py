@@ -1,4 +1,5 @@
 # app/schemas/car_schemas.py
+from datetime import date
 from pydantic import BaseModel
 from typing import Optional
 
@@ -11,6 +12,7 @@ class CarBase(BaseModel):
     cartypedes: Optional[str] = None
     remark: Optional[str] = None
     stat: str # "ใช้งาน" หรือ "ไม่ใช้งาน"
+    will_be_available_at: Optional[date] = None
 
 class Car(CarBase):
     class Config:

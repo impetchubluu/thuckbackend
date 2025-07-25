@@ -31,7 +31,7 @@ async def read_users_me(
         "is_active": current_user.is_active,
         "vencode": None, 
         "car_count": 0,  
-        "cars": []    
+        "cars": [],
     }
 
     if current_user.role == models.UserRoleEnum.vendor and current_user.vencode_ref:

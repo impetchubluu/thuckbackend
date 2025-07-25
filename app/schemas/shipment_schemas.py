@@ -6,7 +6,12 @@ from datetime import date, datetime
 from app.schemas import shipment_detail_schemas
 from app.schemas.car_schemas import CarBase
 
-# ShipmentBase จะเก็บเฉพาะ Fields ที่จำเป็นสำหรับการ "สร้าง" Shipment
+# ShipmentBase จะเก็บเฉพาะ Fields ที่จำเป็นสำหรับการ "สร้าง" Shipment.
+class MVendorSchema(BaseModel):
+    vencode: str
+    venname: str
+    grade: str
+    class Config: from_attributes = True
 class ShipmentCreate(BaseModel):
     shipid: str = Field(..., max_length=10)
     customer_name: Optional[str] = Field(None, max_length=255)
@@ -62,7 +67,7 @@ class Shipment(ShipmentCreate): # สืบทอด Fields ทั้งหม�
     sapstat: Optional[str] = None
     sapupdate: Optional[datetime] = None
     assigned_at: Optional[datetime] = None
-
+    mvendor: Optional[MVendorSchema] = None
     @field_validator('crdate', 'chdate', 'sapupdate', 'apmdate', mode='before')
     @classmethod
     def check_zero_date(cls, v: Any) -> Optional[datetime]:

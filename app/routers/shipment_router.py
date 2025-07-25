@@ -34,14 +34,14 @@ class HoldActionBody(BaseModel):
 
 @router.get("/unassigned", response_model=List[shipment_schemas.Shipment])
 async def read_unassigned_shipments(
-    apmdate: date = Query(..., description="Appointment date to filter (YYYY-MM-DD)"),
+    crdate: date = Query(..., description="create date to filter (YYYY-MM-DD)"),
     shippoint: str = Query(..., description="Shippoint/Warehouse code to filter"),
     db: Session = Depends(get_db)
 ):
     """
     ดึงรายการ Shipments ที่ยังไม่ถูกจัดสรรเข้ารอบ และไม่ได้ถูก Hold
     """
-    filters = {"apmdate": apmdate, "shippoint": shippoint}
+    filters = {"crdate": crdate, "shippoint": shippoint}
     return crud.get_unassigned_shipments(db, filters=filters)
 
 @router.get("/held", response_model=List[shipment_schemas.Shipment])
@@ -192,7 +192,7 @@ async def request_booking(
     if not db_shipment:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Shipment not found")
 
-    if db_shipment.docstat not in ['01', '06', 'RJ']: # 01=รอจัดเข้ารอบ, 06=ยกเลิก, RJ=ถูกปฏิเสธทั้งหมด
+    if db_shipment.docstat not in [ '06', 'RJ']: #  06=ยกเลิก, RJ=ถูกปฏิเสธทั้งหมด
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Shipment with status '{db_shipment.docstat}' cannot be booked.")
 
     first_grade_in_order = GRADE_ASSIGNMENT_ORDER[0]
@@ -214,7 +214,26 @@ async def request_booking(
                 body=f"Shipment ID: {db_shipment.shipid} รอการยืนยัน"
             )
     return db_shipment
+@router.post("/{round_id}/allocate", status_code=status.HTTP_200_OK, summary="Start allocation process for a booking round")
+def start_allocation_for_round(
+    round_id: int,
+    current_user: models.SystemUser = Depends(get_current_active_user),
+    db_session: Session = Depends(get_db)
+):
+    """
+    เริ่มกระบวนการจัดสรรและจ่ายงานทั้งหมดในรอบที่ระบุ (สำหรับ Dispatcher)
+    """
+    if current_user.role not in [models.UserRoleEnum.dispatcher, models.UserRoleEnum.admin]:
+        raise HTTPException(status_code=403, detail="Not authorized")
 
+    try:
+        # เรียกใช้ Logic หลักของเรา
+        crud.allocate_shipments_in_round(db=db_session, round_id=round_id)
+        return {"message": f"Allocation process for round {round_id} has been started."}
+    except Exception as e:
+        # ควรมี Logging ที่ดีกว่านี้ใน Production
+        print(f"CRITICAL: Allocation for round {round_id} failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to allocate shipments: {e}")
 # ในไฟล์ app/routers/shipment_router.py
 
 @router.post("/confirm", response_model=shipment_schemas.Shipment, summary="Vendor confirms a booking")
@@ -347,39 +366,30 @@ async def reject_shipment(
             )
             
     return db_shipment
-@router.post("/{shipid}/hold", response_model=shipment_schemas.Shipment, summary="Hold or Unhold a shipment")
-async def hold_unhold_shipment(
+@router.post("/{shipid}/hold", response_model=shipment_schemas.Shipment, summary="Hold or Unhold a shipment for the next round")
+def hold_shipment_for_next_round(
     shipid: str,
     action: HoldActionBody,
     current_user: models.SystemUser = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
-    """พัก หรือ ยกเลิกการพัก Shipment โดยระบุ shipid ใน Path (Dispatcher)"""
+    """
+    พักงาน (Hold) หรือนำกลับมา (Unhold) เพื่อรอจัดสรรในรอบถัดไป
+    """
     if current_user.role not in get_dispatcher_and_admin_roles():
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not enough permissions")
+        raise HTTPException(status_code=403, detail="Not authorized")
+        
+    updated_shipment = crud.toggle_shipment_hold_status(
+        db=db, 
+        shipid=shipid, 
+        hold=action.hold, 
+        current_user_id=current_user.username
+    )
 
-    db_shipment = crud.get_shipment_by_id(db, shipid=shipid)
-    if not db_shipment:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Shipment not found")
-
-    if action.hold:
-        if db_shipment.is_on_hold:
-            raise HTTPException(status_code=400, detail="Shipment is already on hold")
-        db_shipment.docstat_before_hold = db_shipment.docstat
-        db_shipment.is_on_hold = True
-        db_shipment.docstat = 'HD'
-    else:
-        if not db_shipment.is_on_hold:
-            raise HTTPException(status_code=400, detail="Shipment is not on hold")
-        db_shipment.docstat = db_shipment.docstat_before_hold if db_shipment.docstat_before_hold else '01'
-        db_shipment.is_on_hold = False
-        db_shipment.docstat_before_hold = None
-
-    db_shipment.chuser = current_user.username
-    db_shipment.chdate = datetime.now(timezone.utc)
-    db.commit()
-    db.refresh(db_shipment)
-    return db_shipment
+    if not updated_shipment:
+        raise HTTPException(status_code=404, detail="Shipment not found or cannot be held at this moment.")
+        
+    return updated_shipment
 
 @router.post("/manual-assign", response_model=shipment_schemas.Shipment, summary="Dispatcher manually assigns a vendor")
 async def manual_assign_vendor(

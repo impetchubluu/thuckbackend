@@ -1,9 +1,13 @@
 # app/db/crud.py
+from collections import defaultdict
+import math
 from sqlalchemy.orm import Session, joinedload, selectinload
+
+from app.core import firebase_service
 from . import models
 from ..schemas import shipment_schemas, booking_round_schemas
 from typing import List, Optional
-from datetime import date, datetime, timedelta, time
+from datetime import date, datetime, timedelta, time, timezone
 from sqlalchemy import and_, func, not_, or_
 # --- User CRUD ---
 def get_user_by_username(db: Session, username: str) -> Optional[models.SystemUser]:
@@ -88,13 +92,31 @@ def get_shipments_for_vendor(db: Session, grade: str, vencode: str) -> List[mode
               .order_by(models.Shipment.apmdate.desc())
               .all())
 # --- Booking Round CRUD ---
+def get_booking_round_by_id(db: Session, round_id: int) -> Optional[models.BookingRound]:
+    """
+    ดึงข้อมูล BookingRound เดียวตาม ID พร้อม Eager Load Shipments
+    """
+    return (
+        db.query(models.BookingRound)
+          .options(
+              selectinload(models.BookingRound.shipments)
+          )
+          .filter(models.BookingRound.id == round_id)
+          .first()
+    )
 def get_booking_rounds_by_date(db: Session, round_date: date, warehouse_code: str) -> List[models.BookingRound]:
-    return (db.query(models.BookingRound)
-              .options(selectinload(models.BookingRound.shipments))
-              .filter(models.BookingRound.round_date == round_date, models.BookingRound.warehouse_code == warehouse_code)
-              .order_by(models.BookingRound.round_time)
-              .all())
-
+    return (
+        db.query(models.BookingRound)
+          .options(
+              selectinload(models.BookingRound.shipments)
+          )
+          .filter(
+              models.BookingRound.round_date == round_date, 
+              models.BookingRound.warehouse_code == warehouse_code
+          )
+          .order_by(models.BookingRound.round_time)
+          .all()
+    )
 def create_booking_round(db: Session, round_in: booking_round_schemas.BookingRoundCreate, creator_id: str) -> models.BookingRound:
     db_round = models.BookingRound(
         round_name=round_in.round_name,
@@ -109,14 +131,48 @@ def create_booking_round(db: Session, round_in: booking_round_schemas.BookingRou
     db.flush()
 
     if round_in.shipment_ids:
-        (db.query(models.Shipment)
-           .filter(models.Shipment.shipid.in_(round_in.shipment_ids), models.Shipment.booking_round_id == None)
-           .update({"booking_round_id": db_round.id, "docstat": '01'}, synchronize_session=False))
-
+        shipments_to_assign = (
+            db.query(models.Shipment)
+            .filter(
+                models.Shipment.shipid.in_(round_in.shipment_ids),
+                models.Shipment.booking_round_id.is_(None), # ป้องกันการ assign ซ้ำ
+                models.Shipment.is_on_hold == False # ป้องกันการ assign งานที่ถูก hold
+            )
+        )
+        shipments_to_assign.update({"booking_round_id": db_round.id, "docstat": '01'}, synchronize_session=False)
+    (db.query(models.Shipment)
+       .filter(models.Shipment.is_on_hold == True)
+       .update({"is_on_hold": False, "docstat": models.Shipment.docstat_before_hold}, synchronize_session=False))
     db.commit()
     db.refresh(db_round)
     return db_round
+def toggle_shipment_hold_status(db: Session, shipid: str, hold: bool, current_user_id: str) -> Optional[models.Shipment]:
+    db_shipment = db.query(models.Shipment).filter(models.Shipment.shipid == shipid).first()
+    if not db_shipment:
+        return None
+    
+    # สามารถ Hold ได้เฉพาะงานที่ยังไม่เข้ารอบ
+    if db_shipment.booking_round_id is not None:
+        # อาจจะ return error หรือแค่ return object เดิมไปเฉยๆ
+        return None
 
+    if hold: # ถ้าต้องการ "Hold"
+        if not db_shipment.is_on_hold:
+            db_shipment.docstat_before_hold = db_shipment.docstat # เก็บสถานะเดิม
+            db_shipment.is_on_hold = True
+            # ไม่ต้องเปลี่ยน docstat เป็น 'HD' แล้ว เพราะ is_on_hold จะเป็นตัวควบคุม
+    else: # ถ้าต้องการ "Unhold"
+        if db_shipment.is_on_hold:
+            db_shipment.is_on_hold = False
+            # คืนสถานะกลับไปเป็นสถานะเดิมก่อน Hold
+            db_shipment.docstat = db_shipment.docstat_before_hold 
+            db_shipment.docstat_before_hold = None
+
+    db_shipment.chuser = current_user_id
+    db_shipment.chdate = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(db_shipment)
+    return db_shipment
 # --- Shipment CRUD ---
 def get_unassigned_shipments(db: Session, filters: dict) -> List[models.Shipment]:
     query = (db.query(models.Shipment)
@@ -131,9 +187,9 @@ def get_unassigned_shipments(db: Session, filters: dict) -> List[models.Shipment
 
     if filters.get("shippoint"):
         query = query.filter(models.Shipment.shippoint == filters["shippoint"])
-    if filters.get("apmdate"):
+    if filters.get("crdate"):
         # แปลง string date เป็น date object ก่อนเทียบ
-        query = query.filter(func.date(models.Shipment.apmdate) == filters["apmdate"]) 
+        query = query.filter(func.date(models.Shipment.apmdate) == filters["crdate"]) 
         
     return query.order_by(models.Shipment.shipid).all()
 def get_held_shipments(db: Session, filters: dict) -> List[models.Shipment]:
@@ -208,7 +264,172 @@ def get_shipment_for_update(db: Session, shipid: str) -> Optional[models.Shipmen
     เพื่อป้องกัน Race Condition
     """
     return db.query(models.Shipment).filter(models.Shipment.shipid == shipid).with_for_update().first()
+# แทนที่ฟังก์ชันเดิมใน app/db/crud.py ด้วยอันนี้
+# เพิ่มฟังก์ชันนี้ใน app/db/crud.py
 
+def assign_all_ready_shipments_to_round(db: Session, round_id: int, crdate: date, shippoint: str) -> models.BookingRound:
+    """
+    ค้นหา Shipments ทั้งหมดที่ยังไม่ถูกจัดสรรและไม่ถูก Hold
+    สำหรับ crdate และ shippoint ที่กำหนด แล้ว Assign เข้ารอบทั้งหมด
+    """
+    # 1. ตรวจสอบว่ารอบที่ระบุมีอยู่จริง
+    booking_round = db.query(models.BookingRound).filter(models.BookingRound.id == round_id).first()
+    if not booking_round:
+        raise ValueError(f"Booking round with ID {round_id} not found.")
+
+    # --- 2. ค้นหา Shipments ที่ถูกต้อง ---
+    # เราจะไม่เรียก get_unassigned_shipments แล้ว แต่จะเขียน query ใหม่ที่นี่เลย
+    # เพื่อให้แน่ใจว่าเรา filter ด้วย crdate จริงๆ
+    shipments_to_assign = (
+        db.query(models.Shipment)
+        .filter(
+            models.Shipment.booking_round_id.is_(None),
+            models.Shipment.is_on_hold == False,
+            models.Shipment.shippoint == shippoint,
+            # --- ใช้ func.date() เพื่อเปรียบเทียบเฉพาะส่วนวันที่ของ crdate ---
+            func.date(models.Shipment.crdate) == crdate 
+        )
+        .all()
+    )
+
+    if not shipments_to_assign:
+        print(f"INFO: No unassigned shipments found for crdate={crdate} at shippoint={shippoint} to assign to round {round_id}.")
+        return booking_round
+    
+    shipment_ids_to_update = [s.shipid for s in shipments_to_assign]
+
+    # 3. ทำการ Update Shipments ทั้งหมดใน List ให้มี booking_round_id ที่ถูกต้อง
+    (db.query(models.Shipment)
+       .filter(models.Shipment.shipid.in_(shipment_ids_to_update))
+       .update({"booking_round_id": round_id, "docstat": '01'}, synchronize_session=False)) # '01' = รอจัดสรร
+
+    # 4. (Optional) Unhold งานที่เหลือ
+    # ถ้าต้องการให้งานที่เคย Hold ไว้ กลับมาพร้อมสำหรับรอบหน้า ก็ใส่ Logic นี้
+    (db.query(models.Shipment)
+       .filter(models.Shipment.is_on_hold == True, models.Shipment.shippoint == shippoint)
+       .update({"is_on_hold": False, "docstat": models.Shipment.docstat_before_hold}, synchronize_session=False))
+
+    db.commit()
+    db.refresh(booking_round) # Refresh เพื่อให้ booking_round.shipments มีข้อมูลล่าสุด
+    
+    return booking_round
+def allocate_shipments_in_round(db: Session, round_id: int):
+    """
+    จัดสรรงานในรอบที่ระบุโดยหา Vendor ที่เหมาะสมที่สุดสำหรับแต่ละ Shipment ก่อน
+    แล้วจึงพิจารณาโควต้าของแต่ละเกรด
+    """
+    # 1. ดึงข้อมูลรอบและ Shipments (เหมือนเดิม)
+    booking_round = db.query(models.BookingRound).filter(models.BookingRound.id == round_id).first()
+    if not booking_round:
+        raise ValueError(f"Booking round {round_id} not found.")
+
+    shipments_to_allocate = [s for s in booking_round.shipments if s.docstat == '01']
+    if not shipments_to_allocate:
+        print(f"INFO: No shipments to allocate in round {round_id}.")
+        return
+
+    # 2. เตรียมข้อมูล Vendor ทั้งหมดที่มีรถพร้อมใช้งาน
+    vendor_car_types_query = (
+        db.query(models.MVendor, models.MCar.cartype)
+        .join(models.MCar, models.MVendor.vencode == models.MCar.vencode)
+        .filter(models.MCar.stat == models.StandardStatEnum.active)
+        .all()
+    )
+    
+    vendor_data_map = defaultdict(lambda: {'vendor_obj': None, 'car_types': set()})
+    for vendor, cartype in vendor_car_types_query:
+        vendor_data_map[vendor.vencode]['vendor_obj'] = vendor
+        vendor_data_map[vendor.vencode]['car_types'].add(cartype)
+
+    # 3. เตรียมโครงสร้างสำหรับนับโควต้า
+    total_shipments = len(shipments_to_allocate)
+    quota = {
+        'A': math.ceil(total_shipments * 0.40),
+        'B': math.ceil(total_shipments * 0.30),
+        'C': math.ceil(total_shipments * 0.20),
+        'D': math.ceil(total_shipments * 0.10),
+    }
+    allocated_counts = defaultdict(int)
+
+    # 4. *** [หัวใจของ Logic ใหม่] *** วนลูปตาม Shipment แต่ละชิ้น
+    unassigned_shipments = []
+
+    for shipment in shipments_to_allocate:
+        # 4.1 ค้นหา "ผู้สมัคร" (Candidate Vendors) ทั้งหมดสำหรับ Shipment นี้
+        candidate_vendors = []
+        for v_data in vendor_data_map.values():
+            if shipment.cartype in v_data['car_types']:
+                candidate_vendors.append(v_data['vendor_obj'])
+
+        if not candidate_vendors:
+            print(f"WARNING: No vendor found for shipment {shipment.shipid} with car type {shipment.cartype}. Moving to unassigned.")
+            unassigned_shipments.append(shipment)
+            continue
+
+        # 4.2 จัดลำดับผู้สมัคร: เกรด (A->D) -> วันที่รับงานล่าสุด (เก่า->ใหม่)
+        def sort_key(vendor: models.MVendor):
+            grade_order = {'A': 0, 'B': 1, 'C': 2, 'D': 3}
+            if vendor.last_assigned_at:
+                last_date = vendor.last_assigned_at if vendor.last_assigned_at.tzinfo else vendor.last_assigned_at.replace(tzinfo=timezone.utc)
+            else:
+                # ถ้าไม่มีค่า ให้สร้าง datetime.min ที่เป็น "Aware" โดยกำหนด Timezone เป็น UTC
+                last_date = datetime.min.replace(tzinfo=timezone.utc)
+            return (
+        grade_order.get(vendor.grade, 99), # 1. เรียงตามเกรด
+        last_date,                         # 2. เรียงตามวันที่ (ถ้าไม่เท่ากัน)
+        vendor.vencode                     # 3. เรียงตามรหัสผู้ขาย (ถ้าวันที่เท่ากัน)
+    )
+        candidate_vendors.sort(key=sort_key)
+
+        # 4.3 เลือก Vendor ที่ดีที่สุดที่ "โควต้ายังไม่เต็ม"
+        target_vendor = None
+        for candidate in candidate_vendors:
+            if allocated_counts[candidate.grade] < quota.get(candidate.grade, 0):
+                target_vendor = candidate
+                break # เจอแล้ว!
+
+        # 4.4 ทำการ Assign งาน
+        if target_vendor:
+            grade = target_vendor.grade
+            
+            # --- อัปเดต Shipment ---
+            shipment.vencode = target_vendor.vencode
+            shipment.docstat = '02'
+            shipment.current_grade_to_assign = grade
+            shipment.assigned_at = datetime.now(timezone.utc)
+            shipment.chuser = "SYSTEM_ALLOCATOR"
+            shipment.chdate = datetime.now(timezone.utc)
+            
+            # --- อัปเดตข้อมูล Vendor ---
+            target_vendor.last_assigned_at = datetime.now(timezone.utc)
+            allocated_counts[grade] += 1
+            
+            print(f"INFO: Assigning shipment {shipment.shipid} (req: {shipment.cartype}) to Grade {grade} (Vendor: {target_vendor.vencode})")
+
+            # --- ส่ง Notification (เหมือนเดิม) ---
+            vendors_to_notify = get_users_by_grade(db, grade=grade)
+            for vendor_user in vendors_to_notify:
+                if vendor_user.fcm_token:
+                    # ... โค้ดส่ง notification ...
+                    pass
+        else:
+            # ไม่มี Vendor คนไหนใน List ที่โควต้าว่างเลย
+            print(f"WARNING: All suitable vendors have full quota for shipment {shipment.shipid}. Moving to hold.")
+            shipment.docstat = 'HD'  # เปลี่ยนสถานะเป็น "Hold"
+            shipment.current_grade_to_assign = None
+            shipment.assigned_at = datetime.now(timezone.utc)
+            shipment.chuser = "SYSTEM_ALLOCATOR"
+            shipment.chdate = datetime.now(timezone.utc)
+            unassigned_shipments.append(shipment)
+
+    # 6. Commit การเปลี่ยนแปลงทั้งหมด
+    try:
+        db.commit()
+        print(f"SUCCESS: Allocation for round {round_id} completed successfully.")
+    except Exception as e:
+        db.rollback()
+        print(f"CRITICAL: Failed to commit allocation for round {round_id}. Error: {e}")
+        raise e
 def get_all_vendor_profiles(db: Session) -> List[models.MVendor]:
     """
     ดึงข้อมูลโปรไฟล์ของ Vendor ทั้งหมด (สำหรับ Admin/Dispatcher)
@@ -232,13 +453,68 @@ def get_users_by_grade(db: Session, grade: str) -> List[models.SystemUser]:
               .join(models.MVendor, models.SystemUser.vencode_ref == models.MVendor.vencode)
               .filter(models.MVendor.grade == grade, models.SystemUser.is_active == True)
               .all())
+def get_rounds_pending_confirmation(db: Session) -> List[models.BookingRound]:
+    """
+    ดึงข้อมูลรอบทั้งหมดที่มี Shipment อย่างน้อยหนึ่งรายการ
+    อยู่ในสถานะรอการยืนยันจาก Dispatcher (docstat = '03')
+    """
+    return (
+        db.query(models.BookingRound)
+        .join(models.Shipment) # Join กับ Shipment
+        .filter(models.Shipment.docstat == '03') # กรองเฉพาะที่มี Shipment สถานะ '03'
+        .options(selectinload(models.BookingRound.shipments)) # โหลด Shipments มาด้วย
+        .distinct() # ป้องกันการได้รอบซ้ำ
+        .order_by(models.BookingRound.round_date, models.BookingRound.round_time)
+        .all()
+    )
+
+
+def confirm_all_shipments_in_round(db: Session, round_id: int, current_user_id: str) -> models.BookingRound:
+    """
+    ยืนยันการจ่ายงาน Shipments ทั้งหมดในรอบที่ระบุ
+    - เปลี่ยน docstat จาก '03' เป็น '04'
+    - เรียกใช้ Logic การอัปเดตสถานะรถสำหรับแต่ละ Shipment
+    """
+    # ใช้ with_for_update() เพื่อ Lock ทั้งรอบและ Shipments ที่เกี่ยวข้อง
+    booking_round = db.query(models.BookingRound).filter(models.BookingRound.id == round_id).with_for_update().first()
+    if not booking_round:
+        raise ValueError(f"Booking round with ID {round_id} not found.")
+
+    shipments_to_confirm = [s for s in booking_round.shipments if s.docstat == '03']
+    if not shipments_to_confirm:
+        print(f"INFO: No shipments in round {round_id} are pending confirmation.")
+        return booking_round # ไม่มีอะไรให้ทำ
+    
+    updated_cars = []
+    for shipment in shipments_to_confirm:
+        # --- เรียกใช้ฟังก์ชันที่เรามีอยู่แล้ว ---
+        updated_car = assign_job_to_car(db, shipment=shipment)
+        if not updated_car:
+            # ถ้าการอัปเดตรถล้มเหลว ควรจะ Rollback ทั้งหมด
+            raise Exception(f"Failed to update availability for car {shipment.carlicense} on shipment {shipment.shipid}")
+        
+        updated_cars.append(updated_car)
+        
+        # อัปเดตสถานะ Shipment
+        shipment.docstat = '04' # Dispatcher Assigned
+        shipment.chuser = current_user_id
+        shipment.chdate = datetime.now(timezone.utc)
+    
+    # Commit transaction ทีเดียว
+    db.commit()
+    db.refresh(booking_round)
+    
+    # (Optional) ส่ง Notification กลับไปหา Vendor ว่างานถูกยืนยันแล้ว
+    # ...
+
+    return booking_round
 def get_ongoing_shipments(db: Session, vencode: Optional[str] = None) -> List[models.Shipment]:
     """
     ดึงรายการ Shipments ที่กำลังดำเนินการอยู่
     - ถ้ามี vencode: ดึงเฉพาะของ Vendor คนนั้น
     - ถ้าไม่มี vencode (None): ดึงของทุก Vendor (สำหรับ Admin/Dispatcher)
     """
-    in_progress_statuses = ['03', '04', '05']
+    in_progress_statuses = ['03', '04']
     
     query = (db.query(models.Shipment)
                .options(selectinload(models.Shipment.details))
@@ -261,7 +537,7 @@ def get_past_shipments(db: Session, vencode: Optional[str] = None, filters: dict
     if filters is None:
         filters = {}
 
-    final_statuses = ['06', 'RJ', '05'] # เพิ่ม 05 เข้าไปด้วย
+    final_statuses = ['06', 'RJ', '05'] 
     
     query = (db.query(models.Shipment)
                .options(selectinload(models.Shipment.details)) # Eager load details
