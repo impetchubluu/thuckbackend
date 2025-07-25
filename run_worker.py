@@ -80,7 +80,36 @@ def check_expired_shipments_job():
                         body=f"Shipment ID: {shipment.shipid} เปิดให้รับงาน (หมดเวลาจากเกรดก่อนหน้า)"
                     )
             logging.info(f"    -> Broadcast notification sent for {shipment.shipid}")
+        expired_broadcast_shipments = db.query(models.Shipment).filter(
+            models.Shipment.docstat == 'BC',
+            models.Shipment.assigned_at <= expiration_time_limit
+        ).all()
+        
+        if expired_broadcast_shipments:
+            logging.info(f"Worker Job: Found {len(expired_broadcast_shipments)} broadcast shipments to mark as rejected.")
+            
+            # ดึง Dispatcher ทั้งหมดมาเพื่อส่ง Notification ทีเดียว
+            dispatchers_to_notify = crud.get_all_dispatchers(db)
 
+            for shipment in expired_broadcast_shipments:
+                logging.info(f"  - Processing expired broadcast shipment: {shipment.shipid}")
+                
+                # --- Logic ใหม่: เปลี่ยนสถานะเป็น 'RJ' (Rejected All) ---
+                shipment.docstat = 'HD'  # เปลี่ยนเป็น Hold ก่อน
+                shipment.current_grade_to_assign = None
+                shipment.assigned_at = None
+                shipment.chuser = 'AUTOMATED_WORKER'
+                shipment.chdate = datetime.now(timezone.utc)
+
+                # --- ส่ง Notification แจ้งเตือน Dispatcher ---
+                if dispatchers_to_notify:
+                    for dispatcher in dispatchers_to_notify:
+                        if dispatcher.fcm_token:
+                            firebase_service.send_fcm_notification(
+                                token=dispatcher.fcm_token,
+                                title="⚠️ งานไม่มีผู้รับ (Unclaimed Job)",
+                                body=f"Shipment ID: {shipment.shipid} ไม่มี Vendor กดรับภายในเวลาที่กำหนด"
+                            )
 
         # 5. Commit การเปลี่ยนแปลงทั้งหมดลงฐานข้อมูล
         db.commit()
