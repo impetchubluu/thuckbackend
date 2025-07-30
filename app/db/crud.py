@@ -147,6 +147,9 @@ def create_booking_round(db: Session, round_in: booking_round_schemas.BookingRou
     db.refresh(db_round)
     return db_round
 def toggle_shipment_hold_status(db: Session, shipid: str, hold: bool, current_user_id: str) -> Optional[models.Shipment]:
+    """
+    สลับสถานะ Hold ของ Shipment
+    """
     db_shipment = db.query(models.Shipment).filter(models.Shipment.shipid == shipid).first()
     if not db_shipment:
         return None
@@ -156,23 +159,28 @@ def toggle_shipment_hold_status(db: Session, shipid: str, hold: bool, current_us
         # อาจจะ return error หรือแค่ return object เดิมไปเฉยๆ
         return None
 
-    if hold: # ถ้าต้องการ "Hold"
-        if not db_shipment.is_on_hold:
-            db_shipment.docstat_before_hold = db_shipment.docstat # เก็บสถานะเดิม
-            db_shipment.is_on_hold = True
-            # ไม่ต้องเปลี่ยน docstat เป็น 'HD' แล้ว เพราะ is_on_hold จะเป็นตัวควบคุม
-    else: # ถ้าต้องการ "Unhold"
-        if db_shipment.is_on_hold:
-            db_shipment.is_on_hold = False
-            # คืนสถานะกลับไปเป็นสถานะเดิมก่อน Hold
-            db_shipment.docstat = db_shipment.docstat_before_hold 
-            db_shipment.docstat_before_hold = None
+    try:
+        if hold: # ถ้าต้องการ "Hold"
+            if not db_shipment.is_on_hold:
+                db_shipment.docstat_before_hold = db_shipment.docstat # เก็บสถานะเดิม
+                db_shipment.is_on_hold = True
+                # ไม่ต้องเปลี่ยน docstat เป็น 'HD' แล้ว เพราะ is_on_hold จะเป็นตัวควบคุม
+        else: # ถ้าต้องการ "Unhold"
+            if db_shipment.is_on_hold:
+                db_shipment.is_on_hold = False
+                # คืนสถานะกลับไปเป็นสถานะเดิมก่อน Hold
+                db_shipment.docstat = db_shipment.docstat_before_hold 
+                db_shipment.docstat_before_hold = None
 
-    db_shipment.chuser = current_user_id
-    db_shipment.chdate = datetime.now(timezone.utc)
-    db.commit()
-    db.refresh(db_shipment)
-    return db_shipment
+        db_shipment.chuser = current_user_id
+        db_shipment.chdate = datetime.now(timezone.utc)
+        db.commit()
+        db.refresh(db_shipment)
+        return db_shipment
+    except Exception as e:
+        db.rollback()
+        print(f"ERROR: Failed to toggle hold status for shipment {shipid}: {e}")
+        return None
 # --- Shipment CRUD ---
 def get_unassigned_shipments(db: Session, filters: dict) -> List[models.Shipment]:
     query = (db.query(models.Shipment)
@@ -193,9 +201,28 @@ def get_unassigned_shipments(db: Session, filters: dict) -> List[models.Shipment
         
     return query.order_by(models.Shipment.shipid).all()
 def get_held_shipments(db: Session, filters: dict) -> List[models.Shipment]:
-    query = db.query(models.Shipment).filter(models.Shipment.is_on_hold == True)
-    # ... add filters ...
-    return query.all()
+    """
+    ดึงรายการ Shipments ที่ถูก Hold ไว้
+    """
+    query = (db.query(models.Shipment)
+             .options(
+                 joinedload(models.Shipment.warehouse),
+                 joinedload(models.Shipment.mshiptype),
+                 joinedload(models.Shipment.mleadtime),
+                 selectinload(models.Shipment.details)
+             )
+             .filter(models.Shipment.is_on_hold == True))
+    
+    # Apply filters if provided
+    if filters:
+        if filters.get("shippoint"):
+            query = query.filter(models.Shipment.shippoint == filters["shippoint"])
+        if filters.get("apmdate_from"):
+            query = query.filter(models.Shipment.apmdate >= filters["apmdate_from"])
+        if filters.get("apmdate_to"):
+            query = query.filter(models.Shipment.apmdate <= filters["apmdate_to"])
+    
+    return query.order_by(models.Shipment.apmdate.desc()).all()
 def get_vendor_fcm_token_by_username(db: Session, username: str) -> Optional[str]:
     """ดึง FCM Token ของ Vendor โดยใช้ชื่อผู้ใช้ (Username)"""
     user = db.query(models.SystemUser).filter(models.SystemUser.username == username).first()
@@ -343,12 +370,19 @@ def allocate_shipments_in_round(db: Session, round_id: int):
 
     # 3. เตรียมโครงสร้างสำหรับนับโควต้า
     total_shipments = len(shipments_to_allocate)
-    quota = {
-        'A': math.ceil(total_shipments * 0.40),
-        'B': math.ceil(total_shipments * 0.30),
-        'C': math.ceil(total_shipments * 0.20),
-        'D': math.ceil(total_shipments * 0.10),
-    }
+    # Fix quota calculation to ensure it doesn't exceed 100%
+    quota_percentages = {'A': 0.40, 'B': 0.30, 'C': 0.20, 'D': 0.10}
+    quota = {}
+    remaining_shipments = total_shipments
+    
+    for grade, percentage in quota_percentages.items():
+        if grade == 'D':  # Last grade gets remaining shipments
+            quota[grade] = remaining_shipments
+        else:
+            grade_quota = math.floor(total_shipments * percentage)
+            quota[grade] = grade_quota
+            remaining_shipments -= grade_quota
+    
     allocated_counts = defaultdict(int)
 
     # 4. *** [หัวใจของ Logic ใหม่] *** วนลูปตาม Shipment แต่ละชิ้น
@@ -406,12 +440,22 @@ def allocate_shipments_in_round(db: Session, round_id: int):
             
             print(f"INFO: Assigning shipment {shipment.shipid} (req: {shipment.cartype}) to Grade {grade} (Vendor: {target_vendor.vencode})")
 
-            # --- ส่ง Notification (เหมือนเดิม) ---
-            vendors_to_notify = get_users_by_grade(db, grade=grade)
-            for vendor_user in vendors_to_notify:
-                if vendor_user.fcm_token:
-                    # ... โค้ดส่ง notification ...
-                    pass
+            vendor_user = get_user_by_vendor_code(db, target_vendor.vencode)
+            if vendor_user and vendor_user.fcm_token:
+                try:
+                    firebase_service.send_fcm_notification(
+                        token=vendor_user.fcm_token,
+                        title="มีงานใหม่สำหรับคุณ!",
+                        body=f"Shipment ID: {shipment.shipid} รอการยืนยัน",
+                        data={
+                            "shipment_id": str(shipment.shipid),
+                            "round_id": str(round_id),
+                            "type": "new_assignment"
+                        }
+                    )
+                except Exception as e:
+                    print(f"WARNING: Failed to send notification to vendor {target_vendor.vencode}: {e}")
+                    # Continue with allocation even if notification fails
         else:
             # ไม่มี Vendor คนไหนใน List ที่โควต้าว่างเลย
             print(f"WARNING: All suitable vendors have full quota for shipment {shipment.shipid}. Moving to hold.")
@@ -426,6 +470,9 @@ def allocate_shipments_in_round(db: Session, round_id: int):
     try:
         db.commit()
         print(f"SUCCESS: Allocation for round {round_id} completed successfully.")
+        print(f"Allocation summary: {dict(allocated_counts)}")
+        if unassigned_shipments:
+            print(f"WARNING: {len(unassigned_shipments)} shipments moved to hold due to quota limits.")
     except Exception as e:
         db.rollback()
         print(f"CRITICAL: Failed to commit allocation for round {round_id}. Error: {e}")
@@ -504,8 +551,23 @@ def confirm_all_shipments_in_round(db: Session, round_id: int, current_user_id: 
     db.commit()
     db.refresh(booking_round)
     
-    # (Optional) ส่ง Notification กลับไปหา Vendor ว่างานถูกยืนยันแล้ว
-    # ...
+    # ส่ง Notification กลับไปหา Vendor ว่างานถูกยืนยันแล้ว
+    for shipment in shipments_to_confirm:
+        vendor_user = get_user_by_vencode(db, shipment.vencode)
+        if vendor_user and vendor_user.fcm_token:
+            try:
+                firebase_service.send_fcm_notification(
+                    token=vendor_user.fcm_token,
+                    title="งานของคุณได้รับการยืนยันแล้ว!",
+                    body=f"Shipment ID: {shipment.shipid} ถูกยืนยันโดย Dispatcher",
+                    data={
+                        "shipment_id": str(shipment.shipid),
+                        "round_id": str(round_id),
+                        "type": "shipment_confirmed"
+                    }
+                )
+            except Exception as e:
+                print(f"WARNING: Failed to send confirmation notification to vendor {shipment.vencode}: {e}")
 
     return booking_round
 def get_ongoing_shipments(db: Session, vencode: Optional[str] = None) -> List[models.Shipment]:
@@ -577,19 +639,29 @@ def get_user_by_vencode(db: Session, vencode: str) -> Optional[models.SystemUser
     """ดึง SystemUser โดยใช้ vencode_ref"""
     return db.query(models.SystemUser).filter(models.SystemUser.vencode_ref == vencode).first()
 
+def get_user_by_vendor_code(db: Session, vencode: str) -> Optional[models.SystemUser]:
+    """ดึง SystemUser โดยใช้ vencode_ref - alias for get_user_by_vencode for consistency"""
+    return get_user_by_vencode(db, vencode)
+
 def get_car_by_license(db: Session, carlicense: str) -> Optional[models.MCar]:
     """ดึงข้อมูลรถด้วยทะเบียน"""
     return db.query(models.MCar).filter(models.MCar.carlicense == carlicense).first()
 
 def is_car_available(db: Session, carlicense: str, required_datetime: datetime) -> bool:
-    """เช็คว่ารถว่าง ณ เวลาที่ต้องการหรือไม่"""
-    assignment = (db.query(models.CarAssignment)
-        .filter(
-            models.CarAssignment.carlisence == carlicense,
-            models.CarAssignment.status == 'ASSIGNED',
-            models.CarAssignment.estimated_return_date >= required_datetime
-        ).first())
-    return assignment is None
+    """
+    เช็คว่ารถว่าง ณ เวลาที่ต้องการหรือไม่
+    ใช้ข้อมูลจาก MCar.will_be_available_at แทน CarAssignment
+    """
+    car = db.query(models.MCar).filter(models.MCar.carlicense == carlicense).first()
+    if not car:
+        return False
+    
+    # ถ้าสถานะรถไม่ใช่ "ใช้งาน" หรือมีวันที่ว่างในอนาคต
+    if (car.stat != models.StandardStatEnum.active or 
+        (car.will_be_available_at and car.will_be_available_at > required_datetime.date())):
+        return False
+    
+    return True
 
 
 def complete_or_cancel_car_assignment(db: Session, shipid: str, new_status: str) -> bool:
